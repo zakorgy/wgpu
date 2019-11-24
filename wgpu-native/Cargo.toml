@@ -13,7 +13,7 @@ keywords = ["graphics"]
 license = "MPL-2.0"
 
 [lib]
-crate-type = ["lib", "cdylib", "staticlib"]
+#crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
