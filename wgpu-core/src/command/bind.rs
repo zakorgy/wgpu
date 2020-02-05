@@ -144,7 +144,7 @@ pub struct Binder {
 }
 
 impl Binder {
-    pub(crate) fn new(max_bind_groups: u32) -> Self {
+    pub fn new(max_bind_groups: u32) -> Self {
         Self {
             pipeline_layout_id: None,
             entries: smallvec![Default::default(); max_bind_groups as usize],

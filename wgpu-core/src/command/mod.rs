@@ -9,11 +9,14 @@ mod render;
 mod transfer;
 
 pub(crate) use self::allocator::CommandAllocator;
+pub use self::bind::Binder;
 pub use self::compute::*;
 pub use self::render::*;
 pub use self::transfer::*;
 
 use crate::{
+    command::bind::LayoutChange,
+    binding_model::{BindGroup, PipelineLayout},
     device::{
         MAX_COLOR_TARGETS,
         all_buffer_stages,
@@ -21,12 +24,17 @@ use crate::{
     },
     hub::{GfxBackend, Global, Storage, Token},
     id,
-    resource::{Buffer, Texture},
+    pipeline::ComputePipeline,
+    resource::{Buffer,Texture},
     track::TrackerSet,
     Features,
     LifeGuard,
     Stored,
 };
+
+pub use hal::command::CommandBuffer as _;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use std::{
     marker::PhantomData,
@@ -37,14 +45,15 @@ use std::{
 
 
 #[derive(Clone, Copy, Debug, peek_poke::PeekCopy, peek_poke::Poke)]
-struct PhantomSlice<T>(PhantomData<T>);
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PhantomSlice<T>(PhantomData<T>);
 
 impl<T> PhantomSlice<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         PhantomSlice(PhantomData)
     }
 
-    unsafe fn decode<'a>(
+    pub unsafe fn decode<'a>(
         self, pointer: *const u8, count: usize, bound: *const u8
     ) -> (*const u8, &'a [T]) {
         let align_offset = pointer.align_offset(mem::align_of::<T>());
@@ -108,13 +117,13 @@ impl RawPass {
     }
 
     #[inline]
-    unsafe fn encode<C: peek_poke::Poke>(&mut self, command: &C) {
+    pub unsafe fn encode<C: peek_poke::Poke>(&mut self, command: &C) {
         self.ensure_extra_size(C::max_size());
         self.data = command.poke_into(self.data);
     }
 
     #[inline]
-    unsafe fn encode_slice<T: Copy>(&mut self, data: &[T]) {
+    pub unsafe fn encode_slice<T: Copy>(&mut self, data: &[T]) {
         let align_offset = self.data.align_offset(mem::align_of::<T>());
         let extra = align_offset + mem::size_of::<T>() * data.len();
         self.ensure_extra_size(extra);
@@ -141,6 +150,125 @@ pub struct CommandBuffer<B: hal::Backend> {
 }
 
 impl<B: GfxBackend> CommandBuffer<B> {
+    pub unsafe fn dispatch(&mut self, groups: [u32; 3]) -> Result<(), &'static str> {
+        match self.raw.last_mut() {
+            Some(cb) => {
+                cb.dispatch(groups);
+                Ok(())
+            },
+            None => Err("No command buffer found"),
+        }
+    }
+
+    pub fn max_bind_groups(&self) -> u32{
+        self.features.max_bind_groups
+    }
+
+    pub unsafe fn set_bind_group(
+        &mut self,
+        encoder_id: id::CommandEncoderId,
+        index: u32,
+        bind_group_id: id::BindGroupId,
+        dynamic_offsets: &[u64],
+        bind_group_guard: &Storage<BindGroup<B>, id::BindGroupId>,
+        buffer_guard: &Storage<Buffer<B>, id::BufferId>,
+        texture_guard: &Storage<Texture<B>, id::TextureId>,
+        pipeline_layout_guard: &Storage<PipelineLayout<B>, id::PipelineLayoutId>,
+        binder: &mut Binder,
+    ) -> Result<(), &'static str> {
+        let raw = match self.raw.last_mut() {
+            Some(cb) => cb,
+            None => return Err("No command buffer found"),
+        };
+        let bind_group = self
+            .trackers
+            .bind_groups
+            .use_extend(&*bind_group_guard, bind_group_id, (), ())
+            .unwrap();
+        assert_eq!(bind_group.dynamic_count, dynamic_offsets.len());
+
+        log::trace!(
+            "Encoding barriers on binding of {:?} to {:?}",
+            bind_group_id,
+            encoder_id
+        );
+        CommandBuffer::insert_barriers(
+            raw,
+            &mut self.trackers,
+            &bind_group.used,
+            &*buffer_guard,
+            &*texture_guard,
+        );
+
+        if let Some((pipeline_layout_id, follow_ups)) = binder
+            .provide_entry(index as usize, bind_group_id, bind_group, dynamic_offsets)
+        {
+            let bind_groups = std::iter::once(bind_group.raw.raw())
+                .chain(follow_ups.clone().map(|(bg_id, _)| bind_group_guard[bg_id].raw.raw()));
+
+                raw.bind_compute_descriptor_sets(
+                    &pipeline_layout_guard[pipeline_layout_id].raw,
+                    index as usize,
+                    bind_groups,
+                    dynamic_offsets
+                        .iter()
+                        .chain(follow_ups.flat_map(|(_, offsets)| offsets))
+                        .map(|&off| off as hal::command::DescriptorSetOffset),
+                );
+        }
+        Ok(())
+    }
+
+    pub unsafe fn set_compute_pipeline(
+        &mut self,
+        pipeline_id: id::ComputePipelineId,
+        bind_group_guard: &Storage<BindGroup<B>, id::BindGroupId>,
+        pipeline_guard: &Storage<ComputePipeline<B>, id::ComputePipelineId>,
+        pipeline_layout_guard: &Storage<PipelineLayout<B>, id::PipelineLayoutId>,
+        binder: &mut Binder,
+    ) -> Result<(), &'static str> {
+        let raw = match self.raw.last_mut() {
+            Some(cb) => cb,
+            None => return Err("No command buffer found"),
+        };
+        let pipeline = &pipeline_guard[pipeline_id];
+        raw.bind_compute_pipeline(&pipeline.raw);
+
+        // Rebind resources
+        if binder.pipeline_layout_id != Some(pipeline.layout_id) {
+            let pipeline_layout = &pipeline_layout_guard[pipeline.layout_id];
+            binder.pipeline_layout_id = Some(pipeline.layout_id);
+            binder
+                .reset_expectations(pipeline_layout.bind_group_layout_ids.len());
+            let mut is_compatible = true;
+
+            for (index, (entry, &bgl_id)) in binder
+                .entries
+                .iter_mut()
+                .zip(&pipeline_layout.bind_group_layout_ids)
+                .enumerate()
+            {
+                match entry.expect_layout(bgl_id) {
+                    LayoutChange::Match(bg_id, offsets) if is_compatible => {
+                        let desc_set = bind_group_guard[bg_id].raw.raw();
+                        raw.bind_compute_descriptor_sets(
+                            &pipeline_layout.raw,
+                            index,
+                            std::iter::once(desc_set),
+                            offsets.iter().map(|offset| *offset as u32),
+                        );
+                    }
+                    LayoutChange::Match(..) | LayoutChange::Unchanged => {}
+                    LayoutChange::Mismatch => {
+                        is_compatible = false;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn insert_barriers(
         raw: &mut B::CommandBuffer,
         base: &mut TrackerSet,
